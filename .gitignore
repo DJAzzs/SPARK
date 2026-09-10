@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# 运行产物 / 检查点
+saves/
+checkpoints/
+runs/
+wandb/
+*.safetensors
+*.pt
+*.ckpt
+*.pth
+
+# 大体积数据（数据集/评测语料不入库）
+Dataset/
+data/raw/
+data/cache/
+Qwen--P-MMEval/
+
+# 编译产物
+*.o
+*.so
+*.cu.o
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
