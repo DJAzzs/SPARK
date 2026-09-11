@@ -44,4 +44,4 @@ SPARK/
 
 ## License
 
-MIT（待补充归属信息）
+Apache License 2.0 · Copyright (c) 2025 DJAzzs
