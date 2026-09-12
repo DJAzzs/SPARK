@@ -9,8 +9,10 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 def quantize_weights(module: torch.nn.Module):
     """递归量化所有Linear层为 ChannelFP2"""
-    if '/home/dja/桌面/SPARK' not in sys.path:
-        sys.path.insert(0, '/home/dja/桌面/SPARK')
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    for _p in (_HERE, os.path.join(_HERE, "01_core")):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
     
     from block_fp2_emu import pack_blockwise, unpack_blockwise
     

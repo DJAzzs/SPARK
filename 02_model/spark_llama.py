@@ -1,6 +1,14 @@
 """SPARK LLaMA-style 包装器，兼容 Qwen2/Qwen3 系列"""
 from __future__ import annotations
 
+import os, sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
+for _p in (_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "02_model"),
+           os.path.join(_PROJECT_ROOT, "01_core")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import torch
 from torch import nn
 

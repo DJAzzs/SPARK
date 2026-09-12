@@ -17,7 +17,7 @@ __global__ void k_decode_f32(const unsigned char* __restrict__ packed,
         ((unsigned int)b[2] << 16) |
         ((unsigned int)b[3] << 24);
     const int expv = (int)(b[4] & 0x0Fu);
-    const float scale = __powf(2.0f, (float)(expv - 2));   // 2^(exp-2)
+    const float scale = __powf(2.0f, (float)(expv - 10));  // 2^(exp-10), bias=10
     
 #pragma unroll
     for (int e = 0; e < 16; ++e) {
@@ -49,7 +49,7 @@ __global__ void k_decode_f16(const unsigned char* __restrict__ packed,
         ((unsigned int)b[2] << 16) |
         ((unsigned int)b[3] << 24);
     const int expv = (int)(b[4] & 0x0Fu);
-    const float scale = __powf(2.0f, (float)(expv - 2));
+    const float scale = __powf(2.0f, (float)(expv - 10));
     
 #pragma unroll
     for (int e = 0; e < 16; ++e) {

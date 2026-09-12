@@ -17,7 +17,9 @@
 #define SPARK_BYTES_PER_BLOCK  5       // (16*2 + 4) = 36 bit -> aligned to 40 bit
 
 // decode: value = mantissa * 2^(exp - kExpBias)
-static __device__ __host__ inline float spark_exp_bias() { return 2.0f; }
+// bias=10: scale 网格 2^(e-10) ∈ [2^-10, 2^5]，覆盖 LLM 权重动态范围
+// (典型 |w|<0.1, 块 absmax ~0.03)。bias=2 时最小 scale=0.25 会使真实权重整块归零。
+static __device__ __host__ inline float spark_exp_bias() { return 10.0f; }
 
 // ---- unpack a single block (byte pointer b of length SPARK_BYTES_PER_BLOCK) -----
 template <typename T>

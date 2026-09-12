@@ -71,6 +71,10 @@ def load_kernel(force_rebuild: bool = False):
                                             "/tmp/opencode/spark_ext_build"))
     os.makedirs(build_dir, exist_ok=True)
     inc = f"-I{_KERNEL_DIR}"
+    import time as _time
+    print(f"[SPARK][ext] 编译/加载 CUDA 扩展 (build_dir={build_dir}) ...",
+          flush=True)
+    _t0 = _time.time()
     try:
         mod = ce.load_inline(
             name=_MODULE_NAME,
@@ -87,6 +91,8 @@ def load_kernel(force_rebuild: bool = False):
         raise RuntimeError(
             f"SPARK CUDA 扩展编译失败：{e}\n"
             f"(kernel: {kernel_path}；请确认 nvcc>=12 / sm_120a)") from e
+    print(f"[SPARK][ext] CUDA 扩展就绪 ({_time.time()-_t0:.1f}s, "
+          f"首次编译需 1-5 分钟，多进程并发时其余进程会等文件锁)", flush=True)
     _cache["mod"] = mod
     return mod
 

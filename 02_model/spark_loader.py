@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import os, sys, torch
-sys.path.insert(0, '/home/dja/桌面/远苍')
-sys.path.insert(0, '/home/dja/桌面/SPARK')
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+if os.path.join(_PROJECT_ROOT, "01_core") not in sys.path:
+    sys.path.insert(0, os.path.join(_PROJECT_ROOT, "01_core"))
 
 
 class SparkWeightLoader:
@@ -14,49 +18,64 @@ class SparkWeightLoader:
         assert os.path.exists(pth), f"not found: {pth}"
         self.data = torch.load(pth, map_location="cpu", weights_only=False)
         print(f"[SPARK-LOADER] loaded {len(self.data)} tensors from .spark")
-    
+
     def state_dict(self):
         """返回解码后的 state_dict（FP16/BF16 用于推理）。"""
+        from quant_linear import ChannelFP2Linear, FP2Linear, decode_layer_weight
         state = {}
-        for name, packed in self.data.items():
-            if name.endswith('_packed'):
-                layer_name = name.replace('_packed', '')
-                decoded = self._decode_weight(packed)
-                state[layer_name] = decoded
+
+        # 先用 _scale_index 重建形状提示：_scale_index 形状 = (oc * nb_ic) 或块数
+        # 但 decoder 需要知道 (oc, ic)。从包尺寸推断：n_blocks = numel//5，每行块数未知。
+        # 更稳妥: 打包时同时把 (oc, ic) 维度元数据存进 state_dict（见 exporter）。
+        for name in list(self.data.keys()):
+            if name.endswith('_meta'):
+                meta = self.data[name]
+                pass  # 可选元数据，见 exporter
+
+        # 逐层解码：packed tensor + 其相邻 _scale_index
+        packed_keys = sorted(k for k in self.data.keys() if k.endswith('_packed'))
+        for pk in packed_keys:
+            layer_name = pk.replace('_packed', '')
+            packed = self.data[pk]
+            # 从 meta 恢复形状（exporter 会写 *_meta = (oc, ic)）
+            meta_key = layer_name + '_meta'
+            if meta_key in self.data:
+                oc, ic = int(self.data[meta_key][0]), int(self.data[meta_key][1])
+            else:
+                # fallback: 无法得知精确 (oc, ic)，从包大小推 ic 倍数。这里由调用方
+                # 提供 shape，见 _decode_with_shape。
+                raise KeyError(
+                    f"missing '{meta_key}' shape metadata (oc, ic) for layer "
+                    f"'{layer_name}' — 请用新版 exporter 重新导出")
+            decoded = self._decode_weight(packed, oc, ic)
+            # key 对齐 HF state_dict：量化层的权重名带 `.weight` 后缀
+            state[layer_name + '.weight'] = decoded
         return state
-    
-    def _decode_weight(self, packed: torch.Tensor) -> torch.Tensor:
-        """从 packed uint8 解码为 fp16 weight tensor."""
-        import sys as _sys
-        _sys.path.insert(0, '/home/dja/桌面/SPARK/01_core')
-        try:
-            from build_spark_fp2 import load_kernel
-            k = load_kernel()
-            decoded = k.decode_fp32(packed.to('cuda'), packed.numel()*4)
-            return decoded.view(-1).cpu().to(torch.float16)
-        except Exception as e:
-            print(f"[WARN] CUDA decode failed, use emu: {e}")
-            from block_fp2_emu import unpack_blockwise
-            nb = packed.numel() // 5
-            weights = unpack_blockwise(packed, nb*16, dtype=torch.float32)
-            return weights.view(-1).cpu().to(torch.float16)
+
+    def _decode_weight(self, packed: torch.Tensor, oc: int, ic: int) -> torch.Tensor:
+        """从 packed uint8 解码为 fp16 weight tensor，shape (oc, ic)。
+        自动兼容 v1 (5字节/块) 与 v2 (9字节/双块) 格式。"""
+        from quant_linear import _unpack_weight, ELEMS_PER_BLOCK
+        nb_ic = (ic + ELEMS_PER_BLOCK - 1) // ELEMS_PER_BLOCK
+        n_total = oc * nb_ic * ELEMS_PER_BLOCK
+        decoded = _unpack_weight(packed, n_total,
+                                 device='cuda' if torch.cuda.is_available() else 'cpu')
+        # 还原 (oc, ic)，丢弃 pad
+        return decoded.reshape(oc, -1)[:, :ic].contiguous().to(torch.float16)
 
 
 def load_spark_model(spark_dir: str, hf_base: str):
     """从 .spark 目录加载 FP2 量化模型进行推理。"""
-    import sys as _sys
-    _sys.path.insert(0, '/home/dja/桌面/SPARK')
-    
     from transformers import AutoModelForCausalLM, AutoTokenizer
-    
+
     print(f"[LOAD] HF base: {hf_base}")
     model = AutoModelForCausalLM.from_pretrained(
         hf_base, device_map="cpu", low_cpu_mem_usage=True,
         torch_dtype=torch.float32)
-    
+
     loader = SparkWeightLoader(spark_dir)
     decoded_state = loader.state_dict()
-    
+
     model_state = model.state_dict()
     matched = 0
     for name, weight in decoded_state.items():
@@ -64,13 +83,13 @@ def load_spark_model(spark_dir: str, hf_base: str):
             with torch.no_grad():
                 model_state[name].copy_(weight.to(model_state[name].dtype))
             matched += 1
-    
+
     print(f"[LOAD] matched {matched}/{len(model_state)} weights")
-    
+
     tokenizer = AutoTokenizer.from_pretrained(hf_base, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    
+
     return model.eval(), tokenizer
 
 

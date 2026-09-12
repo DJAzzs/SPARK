@@ -34,6 +34,9 @@ def _tolerance(maxabs):
 # --------------------------------------------------------------------------
 @torch.no_grad()
 def test_emu_kernel_bit_exact():
+    if not torch.cuda.is_available():
+        print("[SKIP] no CUDA GPU available (需要 GPU 才能验证 kernel bit-exact)")
+        return
     k = _load_kernel()
     torch.cuda.empty_cache()
     dev = "cuda:0"
@@ -63,6 +66,9 @@ def test_emu_kernel_bit_exact():
 
 @torch.no_grad()
 def test_calibrated_decode_error_below_1e3():
+    if not torch.cuda.is_available():
+        print("[SKIP] no CUDA GPU available")
+        return
     k = _load_kernel()
     torch.cuda.empty_cache()
     dev = "cuda:0"
@@ -87,7 +93,7 @@ def _calibrated_dequant(w):
     nb, K = wb.shape
     out = torch.zeros_like(wb)
     best_err = None
-    for e in range(4):                       # "四重循环"
+    for e in range(16):                      # 全候选 0..15
         scale = 2.0 ** (e - BIAS)
         cand = torch.where(
             wb.abs() > scale * 0.5,
@@ -106,7 +112,7 @@ def _calibrated_dequant(w):
     nb, K = wb.shape
     out = t2.zeros_like(wb)
     best_err = None
-    for e in range(4):
+    for e in range(16):
         scale = 2.0 ** (e - BIAS)
         cand = t2.where(
             wb.abs() > scale * 0.5,

@@ -11,7 +11,10 @@
 from __future__ import annotations
 
 import os, sys, json, glob
-sys.path.insert(0, '/home/dja/桌面/SPARK')
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 def estimate_size(model_dir: str) -> dict:
     """估算导出体积（只读config，不加载权重）."""

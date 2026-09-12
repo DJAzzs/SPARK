@@ -9,7 +9,12 @@
 from __future__ import annotations
 
 import os, sys, json, argparse
-sys.path.insert(0, '/home/dja/桌面/SPARK/01_core')
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_HERE)                 # SPARK/
+for _p in (_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "01_core"),
+           os.path.join(_PROJECT_ROOT, "02_model")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import torch
 from quant_linear import ChannelFP2Linear, FP2Linear
 
@@ -39,7 +44,7 @@ def calibrate_layer(layer: torch.nn.Module, name: str) -> dict:
             
             # 四重循环搜索指数
             best_exp = 0; best_err = float('inf')
-            for e in range(4):
+            for e in range(16):
                 scale = 2.0 ** (e - 2.0)
                 deq = torch.where(block > scale*0.5, torch.tensor(scale),
                                  torch.zeros_like(block))
