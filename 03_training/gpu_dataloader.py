@@ -272,6 +272,11 @@ class SPARKDataLoader(DataLoader):
         dataset._batch_size = batch_size
         dataset._bucket = bucket
         dataset._bucket_size = bucket_size
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 45    # worker 卡死时 45s 抛 RuntimeError（可诊断），
+                                      # 远短于把 NCCL spin 拖成 Xid 8 的连锁
+        if 'prefetch_factor' not in kwargs and num_workers > 0:
+            kwargs['prefetch_factor'] = 6   # 更深预取缓冲：单 worker 短暂卡顿不阻塞训练
         if bucket:
             super().__init__(
                 dataset,
@@ -279,6 +284,7 @@ class SPARKDataLoader(DataLoader):
                 num_workers=num_workers,
                 collate_fn=_unpack_single,  # 解包（batch_size=None 会包一层 list）
                 shuffle=False,
+                persistent_workers=(num_workers > 0),
                 **kwargs
             )
         else:
@@ -288,6 +294,7 @@ class SPARKDataLoader(DataLoader):
                 num_workers=num_workers,
                 collate_fn=collate_batch,
                 shuffle=False,
+                persistent_workers=(num_workers > 0),
                 **kwargs
             )
 

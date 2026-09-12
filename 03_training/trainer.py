@@ -563,7 +563,7 @@ def main():
                     help="量化策略：fp2=统一 SPFP2 | mixed=NVFP4(attn/DeltaNet)"
                          "+SPFP2(MLP)+BF16(head/状态参数)，对混合注意力架构"
                          "（Qwen3.5 DeltaNet）推荐 mixed")
-    ap.add_argument("--num-workers", type=int, default=4,
+    ap.add_argument("--num-workers", type=int, default=2,
                     help="DataLoader worker 数（4-8；数据侧瓶颈时加大）")
     ap.add_argument("--lr-schedule", default="cosine",
                     choices=["cosine", "constant"],
