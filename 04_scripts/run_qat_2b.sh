@@ -12,6 +12,14 @@
 set -e
 cd /home/dja/桌面/SPARK
 
+# ---- venv 优先（存在则用 .venv 的 torchrun/python）----
+if [ -x ".venv/bin/torchrun" ]; then
+    TORCHRUN="$PWD/.venv/bin/torchrun"
+else
+    TORCHRUN="$(command -v torchrun)"
+fi
+
+
 export PYTHONUNBUFFERED=1
 export NCCL_P2P_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -25,7 +33,7 @@ echo "  model: $MODEL"
 echo "  outdir: $OUTDIR"
 echo "  steps: $STEPS"
 
-exec torchrun --standalone --nproc_per_node=2 \
+exec "$TORCHRUN" --standalone --nproc_per_node=2 \
     03_training/trainer.py \
     --model "$MODEL" \
     --data /home/dja/桌面/SPARK/Dataset \

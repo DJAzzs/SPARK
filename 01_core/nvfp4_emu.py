@@ -4,7 +4,7 @@
   - 数据：4-bit 浮点 E2M1，码值 {0, 0.5, 1, 1.5, 2, 3, 4, 6} × ±
   - scale：每 16 元素块一个 FP8 E4M3（float8_e4m3fn）标量，
     scale = block_amax / 6（6 为 E2M1 最大码值），解码 w ≈ code × scale
-  - 有效密度 ~4.25 bit/权重（4 bit 数据 + 8 bit scale / 16 块）
+  - 有效密度 ~4.5 bit/权重（4 bit 数据 + 8 bit scale / 16 块）
 
 QAT：NVFP4STE 前向走 round-trip，反向纯直通（与 SPFP2 的 ChannelFP2STE 同构）。
 """

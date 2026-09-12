@@ -570,10 +570,11 @@ def main():
                     help="学习率调度：cosine 衰减到 min_lr / constant")
     ap.add_argument("--min-lr", type=float, default=1e-6,
                     help="cosine 调度的终点学习率")
-    ap.add_argument("--w-c4", type=float, default=0.6,
-                    help="c4 数据源的 loss 权重")
-    ap.add_argument("--w-qwen", type=float, default=0.4,
-                    help="qwen 数据源的 loss 权重")
+    ap.add_argument("--w-c4", type=float, default=1.0,
+                    help="c4 数据源的 loss 权重（采样配比已在 dataloader 控制"
+                         "（6:4 混流），loss 默认中性 1:1）")
+    ap.add_argument("--w-qwen", type=float, default=1.0,
+                    help="qwen 数据源的 loss 权重（默认中性）")
     args = ap.parse_args()
 
     rank = _ddp_setup()

@@ -18,6 +18,14 @@ echo "  mode: $MODE"
 
 cd /home/dja/桌面/SPARK
 
+# ---- venv 优先（存在则用 .venv 的 torchrun/python）----
+if [ -x ".venv/bin/torchrun" ]; then
+    TORCHRUN="$PWD/.venv/bin/torchrun"
+else
+    TORCHRUN="$(command -v torchrun)"
+fi
+
+
 export PYTHONUNBUFFERED=1   # 实时输出（trainer 内也做了行缓冲双保险）
 
 COMMON="--data $DATA_PATTERN --outdir $OUTDIR --batch_size 16 --steps 15000 --lr 1e-4 --no-checkpointing"
@@ -29,6 +37,6 @@ else
     # 本机双卡 NCCL P2P 通道 hang（已实测），强制走共享内存；其他机器可尝试去掉
     export NCCL_P2P_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # 抗显存碎片（长/短样本混排时 reserved-unallocated 碎片）
-    exec torchrun --standalone --nproc_per_node=2 \
+    exec "$TORCHRUN" --standalone --nproc_per_node=2 \
          03_training/trainer.py $COMMON --ddp
 fi

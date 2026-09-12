@@ -40,7 +40,8 @@ class SPARKIterableDataset(IterableDataset):
         self.world_size = world_size
 
         if weights is None:
-            weights = {"c4": 1.0, "qwen": 2.0}
+            weights = {"c4": 6.0, "qwen": 4.0}   # 样本级混合配比 c4:qwen
+        self.weights = weights
 
         # 收集所有数据文件并分配权重
         self.files = []
@@ -74,12 +75,12 @@ class SPARKIterableDataset(IterableDataset):
         stride = self.world_size * nw
         return idx, stride
 
-    def _stream_samples(self):
-        """迭代所有数据源的样本（生成器），按行级 stride 分片。"""
+    def _stream_files(self, files):
+        """流式产出给定文件组的样本（行级 stride 分片）。"""
         import pyarrow.parquet as pq
         idx, stride = self._shard()
 
-        for filepath, source, _ in self.files:
+        for filepath, source, _ in files:
             t0 = time.time()
             n_yield = 0
             if filepath.endswith('.gz'):
@@ -119,6 +120,46 @@ class SPARKIterableDataset(IterableDataset):
                     _p(f"[SPARK][data] parquet 流式读取失败 {filepath}: {e}")
             _p(f"[SPARK][data] {os.path.basename(filepath)} 完成: "
                f"产出 {n_yield} 样本 / {time.time()-t0:.1f}s (shard {idx}/{stride})")
+
+    def _stream_samples(self):
+        """双源加权混流：c4 与 qwen 按 weights 比例样本级交替（Bresenham 调度，
+        比例精确）；单源耗尽自动过渡到另一源。分桶逻辑在其上层不受影响。"""
+        c4_files = [f for f in self.files if f[1] == 'c4']
+        qw_files = [f for f in self.files if f[1] == 'qwen']
+        w_c4 = float(self.weights.get('c4', 1.0))
+        w_qw = float(self.weights.get('qwen', 1.0))
+
+        if not qw_files or w_qw <= 0:
+            yield from self._stream_files(c4_files)
+            return
+        if not c4_files or w_c4 <= 0:
+            yield from self._stream_files(qw_files)
+            return
+
+        g = {'c4': self._stream_files(c4_files),
+             'qwen': self._stream_files(qw_files)}
+        exhausted = set()
+        acc = {'c4': 0.0, 'qwen': 0.0}
+        tot = w_c4 + w_qw
+        prob = {'c4': w_c4 / tot, 'qwen': w_qw / tot}
+        n_by = {'c4': 0, 'qwen': 0}
+
+        while len(exhausted) < 2:
+            # 标准 Bresenham 轮转：每轮两源各累加自身概率，取最大者出票
+            # （此前只给被选者累加 → 严格交替 50/50 的 bug）
+            acc['c4'] += prob['c4']
+            acc['qwen'] += prob['qwen']
+            cand = [k for k in ('c4', 'qwen') if k not in exhausted]
+            k = max(cand, key=lambda x: acc[x])
+            try:
+                yield next(g[k])
+                acc[k] -= 1.0
+                n_by[k] += 1
+            except StopIteration:
+                exhausted.add(k)
+                _p(f"[SPARK][data] {k} 源流耗尽 (已产出 {n_by[k]} 样本)")
+        _p(f"[SPARK][data] 混流完成: c4={n_by['c4']} qwen={n_by['qwen']} "
+           f"(配比 {n_by['c4']/max(n_by['qwen'],1):.2f}:1)")
 
     def _make_sample(self, text, source):
         tokens = self.tokenizer(
