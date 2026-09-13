@@ -46,6 +46,15 @@ class SPARKIterableDataset(IterableDataset):
         # 收集所有数据文件并分配权重
         self.files = []
 
+        # 单文件模式：data_dir 直接是一个 .parquet/.json.gz 文件
+        if os.path.isfile(data_dir):
+            src = 'c4' if data_dir.endswith('.gz') else 'qwen'
+            self.files.append((data_dir, src, 1.0))
+            _p(f"[SPARK][data] 单文件模式: {data_dir} (source={src})")
+            total_weight = 1.0
+            self.file_weights = [1.0]
+            return
+
         c4_files = sorted(glob.glob(os.path.join(data_dir, "c4-train.*.json.gz")))
         for f in c4_files:
             self.files.append((f, 'c4', weights['c4']))
@@ -183,7 +192,7 @@ class SPARKIterableDataset(IterableDataset):
         if isinstance(msgs, list):
             return ''.join(m['content'] for m in msgs
                            if isinstance(m, dict) and m.get('role') != 'system')
-        instr = row.get("instruction")
+        instr = row.get("instruction") or row.get("question")
         resp = row.get("response")
         if instr or resp:
             return ((instr or "") + "\n" + (resp or "")).strip()

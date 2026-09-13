@@ -33,3 +33,5 @@ Qwen--P-MMEval/
 .vscode/
 .DS_Store
 .tf5/
+data/spark_v2_*/
+Dataset-fresh/

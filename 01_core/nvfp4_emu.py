@@ -73,3 +73,51 @@ def nvfp4_fake_quant_ste(x: torch.Tensor) -> torch.Tensor:
     if x.requires_grad:
         return NVFP4STE.apply(x)
     return nvfp4_fake_quant(x)
+
+
+# ---- NVFP4 原生存储格式：E2M1 nibble 码流 + FP8 E4M3 块 scale -------------
+# （沿用文件头部 _E2M1_POS tensor，勿重复定义）
+
+def nvfp4_pack(w):
+    """2D (oc, ic) → (codes uint8[ceil(n/2)], scales fp8[oc*ceil(ic/16)])。
+    codes: 每权重 4bit（低/高 nibble 打包），码表 ±{0,.5,1,1.5,2,3,4,6}。
+    与 nvfp4_fake_quant 值等价（roundtrip 无损）。"""
+    import torch as _t
+    wf = w.detach().contiguous().float()
+    oc, ic = wf.shape
+    nb_ic = (ic + 15) // 16
+    ic_p = nb_ic * 16
+    if ic_p != ic:
+        full = _t.zeros(oc, ic_p); full[:, :ic] = wf; wf = full
+    wb = wf.view(oc * nb_ic, 16)
+    amax = wb.abs().amax(dim=1)
+    scales = (amax / 6.0).clamp_min(1e-30).to(_t.float32)
+    scales_fp8 = scales.to(_t.float8_e4m3fn)
+    s = scales_fp8.to(_t.float32).unsqueeze(1)
+    xs = wb / s                                   # 归一化到 E2M1 值域
+    _bounds = _t.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+                        device=xs.device)
+    idx = _t.bucketize(xs.abs(), _bounds)
+    code_idx = idx + _t.where(xs < 0, 8, 0)       # 0..15
+    flat = code_idx.reshape(-1).to(_t.uint8)
+    codes = (flat[0::2] & 0x0F) | ((flat[1::2] & 0x0F) << 4) if flat.numel() % 2 == 0 else None
+    if flat.numel() % 2 == 1:
+        codes = _t.cat([flat, _t.zeros(1, dtype=_t.uint8)])
+        codes = (codes[0::2] & 0x0F) | ((codes[1::2] & 0x0F) << 4)
+    return codes.contiguous(), scales_fp8.contiguous()
+
+def nvfp4_unpack(codes, scales, oc, ic):
+    """逆操作：还原近似 fp32 权重 (oc, ic)。"""
+    import torch as _t
+    n = oc * ((ic + 15) // 16) * 16
+    lo = (codes & 0x0F).long()
+    hi = (codes >> 4).long()
+    flat = _t.stack([lo, hi], dim=1).reshape(-1)[:n]
+    table = _t.cat([_t.tensor(_E2M1_POS), _t.tensor(_E2M1_POS)]).float().to(codes.device)
+    # 负码 (8-15): -table[idx-8]
+    vals = _t.where(flat < 8, table[flat.clamp(max=7)], -table[(flat - 8).clamp(max=7)])
+    s = scales.to(_t.float32)
+    nb_ic = (ic + 15) // 16
+    s_full = s.repeat_interleave(16)
+    out = (vals * s_full[:n]).view(oc, nb_ic * 16)[:, :ic]
+    return out.contiguous()

@@ -88,7 +88,8 @@ class SPARKQATrainer:
                  w_c4: float = 0.6, w_qwen: float = 0.4,
                  quant_mix: str = "fp2", quantize_head: bool = False,
                  ppl_data: str | None = None,
-                 micro_batch: int = 8):
+                 micro_batch: int = 8,
+                 resume_ckpt: str | None = None):
         self.data_parallel = data_parallel
         self.use_deepspeed = deepspeed
         self.token_budget = token_budget   # 单次 fwd+bwd 的最大 token 数（防 logits OOM）
@@ -121,6 +122,21 @@ class SPARKQATrainer:
             _p("[SPARK-QAT] 替换为 QAT 训练层 (channel-FP2 STE fake-quant)...")
             t1 = time.time()
             apply_channel_fp2_qat(self.model)
+
+        if resume_ckpt:
+            # 续训：恢复 QAT 权重 + norm/head 等全部训练终态
+            #（优化器动量不恢复——配合 warmup 重建）
+            _p(f"[SPARK-QAT] 续训: 恢复权重 {resume_ckpt}")
+            from spark_loader import apply_spark_state
+            if os.path.isdir(resume_ckpt):
+                from spark_v2_container import load_spark_v2
+                st = load_spark_v2(resume_ckpt)
+            else:
+                st = torch.load(resume_ckpt, map_location="cpu",
+                                weights_only=False)
+            n1, n2, n3 = apply_spark_state(self.model, st)
+            _p(f"[SPARK-QAT] resume 应用: packed={n1} nvfp4={n2} params={n3}")
+
         _p(f"[SPARK-QAT] 替换完成 ({time.time()-t1:.1f}s), 拷贝模型到 {device} ...")
         t1 = time.time()
         self.model.to(device)
@@ -415,7 +431,7 @@ class SPARKQATrainer:
               accum_steps: int = 8, lr: float = 1e-4,
               log_every: int = 10,
               lr_schedule: str = "cosine", min_lr: float = 1e-6,
-              ppl_every: int = 500):
+              ppl_every: int = 500, warmup_steps: int = 0):
         os.makedirs(outdir, exist_ok=True)
 
         use_ds = self.ds_engine is not None
@@ -433,8 +449,12 @@ class SPARKQATrainer:
         total_opt_steps = max(steps // max(accum_steps, 1), 1)
         scheduler = None
         if lr_schedule == "cosine" and total_opt_steps > 1 and not use_ds:
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_opt_steps, eta_min=min_lr)
+            # warmup>0 时走手动路径（与 DS 一致）；否则保留 torch scheduler
+            if warmup_steps > 0:
+                scheduler = None
+            else:
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=total_opt_steps, eta_min=min_lr)
         if lr_schedule == "cosine" and total_opt_steps > 1 and self.is_main:
             _p(f"[TRAIN] cosine LR: {lr} -> {min_lr} over "
                f"{total_opt_steps} optimizer steps "
@@ -442,10 +462,16 @@ class SPARKQATrainer:
 
         import math as _math
 
-        def _ds_cosine_lr(t):
+        def _lr_at(t):
+            """warmup(线性 0→lr) + cosine(lr→min_lr) 统一调度。"""
             t = min(t, total_opt_steps)
+            if warmup_steps > 0 and t <= warmup_steps:
+                return lr * (t / warmup_steps)
             return min_lr + (lr - min_lr) * (
-                1 + _math.cos(_math.pi * t / total_opt_steps)) / 2
+                1 + _math.cos(_math.pi * (t - warmup_steps)
+                              / max(total_opt_steps - warmup_steps, 1))) / 2
+
+        _ds_cosine_lr = _lr_at   # 兼容旧名
 
         if self.is_main:
             _p(f"[TRAIN] start {steps} steps (accum={accum_steps}, "
@@ -483,6 +509,10 @@ class SPARKQATrainer:
                 opt_step += 1
                 if not use_ds:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    if scheduler is None:      # warmup 手动路径
+                        _lr_t = _lr_at(opt_step)
+                        for _g in optimizer.param_groups:
+                            _g['lr'] = _lr_t
                     optimizer.step()
                     optimizer.zero_grad()
                 if use_ds:
@@ -558,9 +588,14 @@ class SPARKQATrainer:
                     quant_param_ids.add(id(module.weight))
                 elif isinstance(module, (NVFP4QATLinear, NVFP4EmbeddingQAT)):
                     nq += 1
+                    # 原生码流（E2M1 nibble + FP8 scale）：比 bf16 量化值小 4 倍，
+                    # 且 pack 幂等（bf16 值二次量化会因边界穿越差一个码位）
+                    from nvfp4_emu import nvfp4_pack
                     w = module.weight.detach().float()
                     wq = nvfp4_fake_quant(w) if nvfp4_fake_quant else w
-                    state[n + '_nvfp4_weight'] = wq.bfloat16().cpu()
+                    codes, scales = nvfp4_pack(wq)
+                    state[n + '_nvfp4_codes'] = codes.cpu()
+                    state[n + '_nvfp4_scales'] = scales.cpu()
                     oc, ic = module.weight.shape
                     state[n + '_meta'] = torch.tensor([oc, ic], dtype=torch.long)
                     quant_param_ids.add(id(module.weight))
@@ -605,6 +640,14 @@ def main():
     ap.add_argument("--optim-8bit", action="store_true",
                     help="DeepSpeed 分支下用 bitsandbytes AdamW8bit（9B 显存"
                          "兜底，每卡省约 18GB；需 pip install bitsandbytes）")
+    ap.add_argument("--sample-c4", type=float, default=6.0,
+                    help="混流采样权重 c4 分量（默认 6 → 6:4）")
+    ap.add_argument("--sample-qwen", type=float, default=4.0,
+                    help="混流采样权重 qwen 分量")
+    ap.add_argument("--resume-ckpt", default=None,
+                    help="续训：恢复 QAT 权重（.pt 或 v2 容器）；配合 --warmup-steps")
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="优化器步数的线性热身（续训时建议 ~200 重建动量）")
     ap.add_argument("--ppl-every", type=int, default=500,
                     help="每 N 步测一次 PPL（0=关闭；checkpoint 仍每 1000 步）")
     ap.add_argument("--ppl-data", default="data/wikitext2-val",
@@ -654,12 +697,15 @@ def main():
                              quant_mix=args.quant_mix,
                              quantize_head=args.quantize_head,
                              ppl_data=args.ppl_data,
-                             micro_batch=args.batch_size)
+                             micro_batch=args.batch_size,
+                             resume_ckpt=args.resume_ckpt)
 
     _p("[DATA ] 初始化流式 dataloader（仅读 metadata，不整表加载）...")
     t0 = time.time()
-    dataset = SPARKIterableDataset(args.data, trainer.tokenizer, 2048,
-                                   rank=max(rank, 0), world_size=world_size)
+    dataset = SPARKIterableDataset(
+        args.data, trainer.tokenizer, 2048,
+        rank=max(rank, 0), world_size=world_size,
+        weights={"c4": args.sample_c4, "qwen": args.sample_qwen})
     dataloader = SPARKDataLoader(dataset, batch_size=args.batch_size,
                                  pin_memory=torch.cuda.is_available(),
                                  num_workers=args.num_workers)
@@ -671,7 +717,7 @@ def main():
                   accum_steps=args.accum, lr=args.lr,
                   log_every=args.log_every,
                   lr_schedule=args.lr_schedule, min_lr=args.min_lr,
-                  ppl_every=args.ppl_every)
+                  ppl_every=args.ppl_every, warmup_steps=args.warmup_steps)
 
 
 if __name__ == "__main__":

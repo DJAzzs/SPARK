@@ -395,8 +395,11 @@ class NVFP4QATLinear(nn.Module):
         self._wq_cache: Optional[torch.Tensor] = None
         self._wq_ver: int = -1
 
+    force_fake_quant: bool = False   # eval 时也走量化前向（PPL 评测用）；
+                                     # 曾缺失导致 PPL 读数虚高（154 层未量化）
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training:
+        if self.training or self.force_fake_quant:
             if self._wq_cache is None or self._wq_ver != _WQ_VERSION[0]:
                 with torch.no_grad():
                     self._wq_cache = nvfp4_fake_quant(
