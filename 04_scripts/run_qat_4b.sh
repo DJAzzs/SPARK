@@ -7,11 +7,13 @@
 set -e
 cd /home/dja/桌面/SPARK
 
-# ---- venv 优先（存在则用 .venv 的 torchrun/python）----
-if [ -x ".venv/bin/torchrun" ]; then
-    TORCHRUN="$PWD/.venv/bin/torchrun"
+# ---- venv 优先：用 venv 的 python -m torch.distributed.run ----
+# torch 是 .pth 继承的（.venv/bin/torchrun 入口不存在），必须用 python -m
+# 才能带上 venv 的 sys.path（transformers 5.17 / bitsandbytes）。
+if [ -x ".venv/bin/python3" ]; then
+    PY="$PWD/.venv/bin/python3"
 else
-    TORCHRUN="$(command -v torchrun)"
+    PY="$(command -v python3)"
 fi
 
 
@@ -21,13 +23,13 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # 抗显存碎片
 
 MODEL=${MODEL:-/home/dja/桌面/Models/Qwen3.5-4B}
 OUTDIR=${OUTDIR:-/home/dja/桌面/SPARK/saves/spark-qat-4b}
-STEPS=${STEPS:-15000}
+STEPS=${STEPS:-8000}
 
 echo "=== SPARK QAT 4B (DeepSpeed ZeRO-2) ==="
 echo "  model: $MODEL"
 echo "  outdir: $OUTDIR"
 
-exec "$TORCHRUN" --standalone --nproc_per_node=2 \
+exec "$PY" -m torch.distributed.run --standalone --nproc_per_node=2 \
     03_training/trainer.py \
     --model "$MODEL" \
     --data /home/dja/桌面/SPARK/Dataset \
@@ -35,8 +37,11 @@ exec "$TORCHRUN" --standalone --nproc_per_node=2 \
     --batch_size 8 \
     --accum 8 \
     --steps "$STEPS" \
-    --lr 1e-4 \
+    --lr 7e-5 \
     --dtype bf16 \
     --log-every 5 \
     --ppl-data data/wikitext2.txt \
+    --token-budget 4096 \
+    --quant-mix mixed \
+    --quantize-head \
     --deepspeed

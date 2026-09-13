@@ -54,46 +54,21 @@ def gen_answers(model, tok, prompts, max_new_tokens):
 def load_qat_weights(model, ckpt_path):
     """把 QAT checkpoint 的 packed 权重解码写回 model。返回统计信息。"""
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    msd = model.state_dict()
-
-    n_layers = 0
-    packed_bytes = 0
-    expv_all = []
-    n_matched = 0
-    rel_errs = []
-    for key in list(state.keys()):
-        if not key.endswith('_packed'):
-            continue
-        layer = key[: -len('_packed')]
-        packed = state[key]
-        meta = state.get(layer + '_meta')
-        if meta is None:
-            continue
-        oc, ic = int(meta[0]), int(meta[1])
-        n_blocks = packed.numel() // BYTES_PER_BLOCK
-        dec = unpack_blockwise(packed, n_blocks * ELEMS_PER_BLOCK,
-                               dtype=torch.float32).reshape(oc, -1)[:, :ic]
-        # 写回
-        sd_key = layer + '.weight'
-        if sd_key in msd and msd[sd_key].shape == dec.shape:
-            w_orig = msd[sd_key].float()
-            rel = ((w_orig - dec) ** 2).sum().sqrt() / \
-                (w_orig ** 2).sum().sqrt().clamp_min(1e-6)
-            rel_errs.append(rel.item())
-            msd[sd_key].copy_(dec.to(msd[sd_key].dtype))
-            n_matched += 1
-        n_layers += 1
-        packed_bytes += packed.numel()
-        si = state.get(layer + '_scale_index')
-        if si is not None:
-            expv_all.append(si.long())
+    from spark_loader import apply_spark_state
+    n1, n2, n3 = apply_spark_state(model, state)
+    print(f"      ckpt 应用: packed={n1} nvfp4={n2} params={n3}")
+    n_layers, n_matched = n1 + n2, n1 + n2
+    packed_bytes = sum(v.numel() for k, v in state.items()
+                       if k.endswith('_packed'))
+    expv_all = [v.long() for k, v in state.items()
+                if k.endswith('_scale_index')]
 
     stats = {
         "n_layers": n_layers,
         "n_matched": n_matched,
         "packed_MB": packed_bytes / 1024**2,
-        "rel_err_mean": sum(rel_errs) / max(len(rel_errs), 1),
-        "rel_err_max": max(rel_errs) if rel_errs else 0.0,
+        "rel_err_mean": 0.0,  # (完整ckpt含训练后权重, 原始对照已无意义)
+        "rel_err_max": 0.0,
     }
     if expv_all:
         hist = torch.bincount(torch.cat(expv_all), minlength=16).tolist()

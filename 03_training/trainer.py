@@ -87,7 +87,8 @@ class SPARKQATrainer:
                  eight_bit_optim: bool = False,
                  w_c4: float = 0.6, w_qwen: float = 0.4,
                  quant_mix: str = "fp2", quantize_head: bool = False,
-                 ppl_data: str | None = None):
+                 ppl_data: str | None = None,
+                 micro_batch: int = 8):
         self.data_parallel = data_parallel
         self.use_deepspeed = deepspeed
         self.token_budget = token_budget   # 单次 fwd+bwd 的最大 token 数（防 logits OOM）
@@ -153,8 +154,9 @@ class SPARKQATrainer:
                 },
                 "gradient_accumulation_steps": accum_steps,
                 "gradient_clipping": 1.0,
-                "train_batch_size": "auto",
-                "train_micro_batch_size_per_gpu": "auto",
+                # 具体值（"auto" 需 training_data 才能解析；自管 dataloader 时
+                # str 与 int 比较会崩 TypeError）
+                "train_micro_batch_size_per_gpu": micro_batch,
                 "wall_clock_breakdown": False,
                 "steps_per_print": 100,
             }
@@ -266,9 +268,14 @@ class SPARKQATrainer:
         nq = set_force_fake_quant(m, True)
         blocks = self._ppl_blocks[:max_blocks]
         total_nll, total_tok = 0.0, 0
+        # bf16 autocast：PPL 直调裸模块（绕过 DS 引擎的 cast 包装），
+        # 与训练时的 dtype 环境对齐，避免 fp32/bf16 混流崩溃
+        ac = (torch.autocast("cuda", dtype=torch.bfloat16)
+              if self.device.type == "cuda" else torch.autocast("cpu"))
         for i in range(0, blocks.shape[0], batch):
             ids = blocks[i:i + batch]
-            out = m(input_ids=ids, labels=ids)
+            with ac:
+                out = m(input_ids=ids, labels=ids)
             total_nll += out.loss.item() * ids.numel()
             total_tok += ids.numel()
         set_force_fake_quant(m, False)
@@ -315,6 +322,10 @@ class SPARKQATrainer:
             else:
                 l_qw.append(loss)
 
+        # 归一化加权：total = (w_c4·c4 + w_qwen·qwen) / (w_c4 + w_qwen)。
+        # 历史事故：1:1 权重未归一化时 total loss ×3.6 → 等效 lr 过冲 →
+        # 权重塌缩 + PPL 停滞 2000 高原（2B 10000 步实测，2026-09-13）。
+        wsum = self.loss_weights["c4"] + self.loss_weights["qwen"]
         total_loss = torch.tensor(0.0, device=self.device)
         c4 = qwen = None
         if l_c4:
@@ -323,6 +334,7 @@ class SPARKQATrainer:
         if l_qw:
             qwen = torch.stack(l_qw).mean()
             total_loss = total_loss + self.loss_weights["qwen"] * qwen
+        total_loss = total_loss / wsum
 
         info = {"c4": c4.detach().item() if c4 is not None else 0.0,
                 "qwen": qwen.detach().item() if qwen is not None else 0.0}
@@ -420,13 +432,20 @@ class SPARKQATrainer:
         # 总 optimizer 步数 = micro 步数 / 梯度累积；衰减到 min_lr。
         total_opt_steps = max(steps // max(accum_steps, 1), 1)
         scheduler = None
-        if lr_schedule == "cosine" and total_opt_steps > 1:
-            sched_opt = (self.ds_engine.optimizer if use_ds else optimizer)
+        if lr_schedule == "cosine" and total_opt_steps > 1 and not use_ds:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                sched_opt, T_max=total_opt_steps, eta_min=min_lr)
-            if self.is_main:
-                _p(f"[TRAIN] cosine LR: {lr} -> {min_lr} over "
-                   f"{total_opt_steps} optimizer steps")
+                optimizer, T_max=total_opt_steps, eta_min=min_lr)
+        if lr_schedule == "cosine" and total_opt_steps > 1 and self.is_main:
+            _p(f"[TRAIN] cosine LR: {lr} -> {min_lr} over "
+               f"{total_opt_steps} optimizer steps "
+               f"({'DeepSpeed 手动 cosine' if use_ds else 'torch scheduler'})")
+
+        import math as _math
+
+        def _ds_cosine_lr(t):
+            t = min(t, total_opt_steps)
+            return min_lr + (lr - min_lr) * (
+                1 + _math.cos(_math.pi * t / total_opt_steps)) / 2
 
         if self.is_main:
             _p(f"[TRAIN] start {steps} steps (accum={accum_steps}, "
@@ -466,13 +485,19 @@ class SPARKQATrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
-                if scheduler is not None:
+                if use_ds:
+                    # DeepSpeedZeroOptimizer 非 torch Optimizer 子类，
+                    # cosine 手动写入 param_groups（与 torch scheduler 等价）
+                    _lr_t = _ds_cosine_lr(opt_step)
+                    for _g in self.ds_engine.optimizer.param_groups:
+                        _g['lr'] = _lr_t
+                elif scheduler is not None:
                     scheduler.step()
                 # 权重已更新 → 所有 QAT 层的 fake-quant 缓存失效
                 bump_wq_version()
 
                 cur_lr = (scheduler.get_last_lr()[0] if scheduler is not None
-                          else lr)
+                          else (_ds_cosine_lr(opt_step) if use_ds else lr))
                 # 实时日志：前 3 个 optimizer step 每步打，之后每 log_every 步
                 if self.is_main and (opt_step <= 3 or opt_step % log_every == 0):
                     now = time.time()
@@ -498,7 +523,13 @@ class SPARKQATrainer:
             _p(f"[DONE ] training finished in {(time.time()-t0)/60:.1f} min")
 
     def _save_quantized(self, outdir, tag="final"):
-        """对训练好的量化层 quantize() 生成 packed，保存供导出（仅 rank0）。"""
+        """保存完整训练终态（仅 rank0）：
+        - SPFP2 层：_packed(v2)/_scale_index/_meta
+        - NVFP4 层（attn/embed/tied-head）：_nvfp4_weight（fake-quant 值, bf16）+ _meta
+        - 其余全部参数（norm/lm_head/A_log 等训练中更新过的）：param::前缀 bf16
+        历史 bug：曾只存 SPFP2 层 → mixed 模式丢 NVFP4/lm_head；
+        norm 不同步会使 eval 成为"新量化层+旧norm"的错配体。
+        """
         if not self.is_main:
             return
         if self.device.type == "cuda":
@@ -506,22 +537,45 @@ class SPARKQATrainer:
         state = {}
         nq = 0
         m = self._unwrap()
+        from quant_linear import (ChannelFP2QATLinear, NVFP4QATLinear,
+                                  NVFP4EmbeddingQAT)
+        try:
+            from nvfp4_emu import nvfp4_fake_quant
+        except ImportError:
+            nvfp4_fake_quant = None
+        quant_param_ids = set()
         with torch.no_grad():
             for name, module in m.named_modules():
+                n = name.replace('.weight', '')
                 if isinstance(module, ChannelFP2QATLinear):
                     module.quantize()
                     nq += 1
-                    n = name.replace('.weight', '')
                     state[n + '_packed'] = module._packed_weight.cpu()
                     if module._channel_scale_index is not None:
                         state[n + '_scale_index'] = module._channel_scale_index.cpu()
                     state[n + '_meta'] = torch.tensor(
                         [module.out_features, module.in_features], dtype=torch.long)
+                    quant_param_ids.add(id(module.weight))
+                elif isinstance(module, (NVFP4QATLinear, NVFP4EmbeddingQAT)):
+                    nq += 1
+                    w = module.weight.detach().float()
+                    wq = nvfp4_fake_quant(w) if nvfp4_fake_quant else w
+                    state[n + '_nvfp4_weight'] = wq.bfloat16().cpu()
+                    oc, ic = module.weight.shape
+                    state[n + '_meta'] = torch.tensor([oc, ic], dtype=torch.long)
+                    quant_param_ids.add(id(module.weight))
+            # 非量化参数（norm / lm_head(BF16训练) / A_log 等）——训练更新必须随行
+            for pname, p in m.named_parameters():
+                if id(p) in quant_param_ids:
+                    continue
+                state['param::' + pname] = p.detach().float().bfloat16().cpu()
         os.makedirs(outdir, exist_ok=True)
         path = os.path.join(outdir, f"spark-qat-{tag}.pt")
         torch.save(state, path)
         size_mb = os.path.getsize(path) / (1024 ** 2)
-        _p(f"[CKPT ] saved {nq} quantized layers -> {path} ({size_mb:.1f}MB)")
+        _p(f"[CKPT ] saved {nq} quant layers + "
+           f"{sum(1 for k in state if k.startswith('param::'))} params "
+           f"-> {path} ({size_mb:.1f}MB)")
 
 
 def main():
@@ -599,7 +653,8 @@ def main():
                              w_c4=args.w_c4, w_qwen=args.w_qwen,
                              quant_mix=args.quant_mix,
                              quantize_head=args.quantize_head,
-                             ppl_data=args.ppl_data)
+                             ppl_data=args.ppl_data,
+                             micro_batch=args.batch_size)
 
     _p("[DATA ] 初始化流式 dataloader（仅读 metadata，不整表加载）...")
     t0 = time.time()

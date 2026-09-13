@@ -97,3 +97,41 @@ if __name__ == '__main__':
     loader = SparkWeightLoader("/home/dja/桌面/SPARK/data/spark_checkpoint")
     sd = loader.state_dict()
     print("state dict keys:", list(sd.keys())[:5])
+
+
+def apply_spark_state(model, state):
+    """把 SPARK checkpoint 完整应用到模型（三种条目）：
+    - <layer>_packed (+_meta):   SPFP2 v1/v2 解码写回
+    - <layer>_nvfp4_weight:      NVFP4 量化值直接写回
+    - param::<name>:             非量化参数（norm/lm_head/A_log 等）
+    返回 (n_packed, n_nvfp4, n_param)。"""
+    from quant_linear import _unpack_weight, ELEMS_PER_BLOCK
+    msd = model.state_dict()
+    n1 = n2 = n3 = 0
+    for key in list(state.keys()):
+        if key.endswith('_packed'):
+            layer = key[: -len('_packed')]
+            meta = state.get(layer + '_meta')
+            if meta is None:
+                continue
+            oc, ic = int(meta[0]), int(meta[1])
+            nb_ic = (ic + ELEMS_PER_BLOCK - 1) // ELEMS_PER_BLOCK
+            dec = _unpack_weight(state[key], oc * nb_ic * ELEMS_PER_BLOCK)
+            dec = dec.reshape(oc, -1)[:, :ic]
+            sd = layer + '.weight'
+            if sd in msd and msd[sd].shape == dec.shape:
+                msd[sd].copy_(dec.to(msd[sd].dtype))
+                n1 += 1
+        elif key.endswith('_nvfp4_weight'):
+            layer = key[: -len('_nvfp4_weight')]
+            sd = layer + '.weight'
+            w = state[key].float()
+            if sd in msd and msd[sd].shape == w.shape:
+                msd[sd].copy_(w.to(msd[sd].dtype))
+                n2 += 1
+        elif key.startswith('param::'):
+            sd = key[len('param::'):]
+            if sd in msd and msd[sd].shape == state[key].shape:
+                msd[sd].copy_(state[key].float().to(msd[sd].dtype))
+                n3 += 1
+    return n1, n2, n3

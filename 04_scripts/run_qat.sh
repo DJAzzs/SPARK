@@ -18,11 +18,13 @@ echo "  mode: $MODE"
 
 cd /home/dja/桌面/SPARK
 
-# ---- venv 优先（存在则用 .venv 的 torchrun/python）----
-if [ -x ".venv/bin/torchrun" ]; then
-    TORCHRUN="$PWD/.venv/bin/torchrun"
+# ---- venv 优先：用 venv 的 python -m torch.distributed.run ----
+# torch 是 .pth 继承的（.venv/bin/torchrun 入口不存在），必须用 python -m
+# 才能带上 venv 的 sys.path（transformers 5.17 / bitsandbytes）。
+if [ -x ".venv/bin/python3" ]; then
+    PY="$PWD/.venv/bin/python3"
 else
-    TORCHRUN="$(command -v torchrun)"
+    PY="$(command -v python3)"
 fi
 
 
@@ -37,6 +39,6 @@ else
     # 本机双卡 NCCL P2P 通道 hang（已实测），强制走共享内存；其他机器可尝试去掉
     export NCCL_P2P_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # 抗显存碎片（长/短样本混排时 reserved-unallocated 碎片）
-    exec "$TORCHRUN" --standalone --nproc_per_node=2 \
+    exec "$PY" -m torch.distributed.run --standalone --nproc_per_node=2 \
          03_training/trainer.py $COMMON --ddp
 fi

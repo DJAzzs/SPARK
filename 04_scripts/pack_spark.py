@@ -76,6 +76,7 @@ def main():
         tok.pad_token = tok.eos_token
 
     state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    from spark_loader import apply_spark_state
     msd = model.state_dict()
     n = 0
     for key in list(state.keys()):

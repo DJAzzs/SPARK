@@ -84,25 +84,10 @@ def compute_ppl(model, blocks, device, max_blocks=40, batch=4):
 
 def load_qat_weights(model, ckpt_path):
     """QAT checkpoint 的 packed 权重解码写回（v1/v2 自检测）。"""
-    from quant_linear import _unpack_weight, ELEMS_PER_BLOCK
     state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    msd = model.state_dict()
-    n = 0
-    for key in list(state.keys()):
-        if not key.endswith('_packed'):
-            continue
-        layer = key[: -len('_packed')]
-        meta = state.get(layer + '_meta')
-        if meta is None:
-            continue
-        oc, ic = int(meta[0]), int(meta[1])
-        nb_ic = (ic + ELEMS_PER_BLOCK - 1) // ELEMS_PER_BLOCK
-        dec = _unpack_weight(state[key], oc * nb_ic * ELEMS_PER_BLOCK)
-        sd_key = layer + '.weight'
-        if sd_key in msd and msd[sd_key].shape == dec.reshape(oc, -1)[:, :ic].shape:
-            msd[sd_key].copy_(dec.reshape(oc, -1)[:, :ic].to(msd[sd_key].dtype))
-            n += 1
-    print(f"[PPL] ckpt 解码写回 {n} 层")
+    from spark_loader import apply_spark_state
+    n1, n2, n3 = apply_spark_state(model, state)
+    print(f"[PPL] ckpt 应用: packed={n1} nvfp4={n2} params={n3}")
 
 
 def main():

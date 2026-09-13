@@ -11,11 +11,13 @@
 set -e
 cd /home/dja/桌面/SPARK
 
-# ---- venv 优先（存在则用 .venv 的 torchrun/python）----
-if [ -x ".venv/bin/torchrun" ]; then
-    TORCHRUN="$PWD/.venv/bin/torchrun"
+# ---- venv 优先：用 venv 的 python -m torch.distributed.run ----
+# torch 是 .pth 继承的（.venv/bin/torchrun 入口不存在），必须用 python -m
+# 才能带上 venv 的 sys.path（transformers 5.17 / bitsandbytes）。
+if [ -x ".venv/bin/python3" ]; then
+    PY="$PWD/.venv/bin/python3"
 else
-    TORCHRUN="$(command -v torchrun)"
+    PY="$(command -v python3)"
 fi
 
 
@@ -32,7 +34,7 @@ echo "  model: $MODEL"
 echo "  outdir: $OUTDIR"
 echo "  steps: $STEPS"
 
-exec "$TORCHRUN" --standalone --nproc_per_node=2 \
+exec "$PY" -m torch.distributed.run --standalone --nproc_per_node=2 \
     03_training/trainer.py \
     --model "$MODEL" \
     --data /home/dja/桌面/SPARK/Dataset \

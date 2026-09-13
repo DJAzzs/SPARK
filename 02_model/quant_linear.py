@@ -267,7 +267,7 @@ class ChannelFP2QATLinear(nn.Module):
             if self._wq_cache is None or self._wq_ver != _WQ_VERSION[0]:
                 with torch.no_grad():
                     self._wq_cache = channel_fake_quantize(
-                        self.weight.detach()).detach()
+                        self.weight.detach()).detach().to(self.weight.dtype)
                 self._wq_ver = _WQ_VERSION[0]
             w_eff = self.weight + (self._wq_cache - self.weight).detach()
             return torch.nn.functional.linear(x, w_eff, self.bias)
@@ -399,7 +399,8 @@ class NVFP4QATLinear(nn.Module):
         if self.training:
             if self._wq_cache is None or self._wq_ver != _WQ_VERSION[0]:
                 with torch.no_grad():
-                    self._wq_cache = nvfp4_fake_quant(self.weight.detach()).detach()
+                    self._wq_cache = nvfp4_fake_quant(
+                        self.weight.detach()).detach().to(self.weight.dtype)
                 self._wq_ver = _WQ_VERSION[0]
             w_eff = self.weight + (self._wq_cache - self.weight).detach()
             return torch.nn.functional.linear(x, w_eff, self.bias)
@@ -440,7 +441,8 @@ class INT8QATLinear(nn.Module):
         if self.training or self.force_fake_quant:
             if self._wq_cache is None or self._wq_ver != _WQ_VERSION[0]:
                 with torch.no_grad():
-                    self._wq_cache = int8_fake_quant(self.weight.detach()).detach()
+                    self._wq_cache = int8_fake_quant(
+                        self.weight.detach()).detach().to(self.weight.dtype)
                 self._wq_ver = _WQ_VERSION[0]
             w_eff = self.weight + (self._wq_cache - self.weight).detach()
             return torch.nn.functional.linear(x, w_eff, self.bias)
@@ -472,7 +474,8 @@ class NVFP4EmbeddingQAT(nn.Module):
         if self.training or self.force_fake_quant:
             if self._wq_cache is None or self._wq_ver != _WQ_VERSION[0]:
                 with torch.no_grad():
-                    self._wq_cache = nvfp4_fake_quant(w.detach()).detach()
+                    self._wq_cache = nvfp4_fake_quant(
+                        w.detach()).detach().to(self.weight.dtype)
                 self._wq_ver = _WQ_VERSION[0]
             w = self.weight + (self._wq_cache - self.weight).detach()
         return torch.nn.functional.embedding(
