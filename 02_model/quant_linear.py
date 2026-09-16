@@ -41,6 +41,18 @@ except Exception:
     _INT8_AVAILABLE = False
 
 try:
+    from two_four import two_four_pack, two_four_unpack, two_four_fake_quant  # noqa: E402
+    _V3_AVAILABLE = True
+except Exception:
+    _V3_AVAILABLE = False
+
+try:
+    from fp3_linear import FP3QATLinear  # noqa: E402
+    _FP3_TIER_OK = True
+except Exception:
+    _FP3_TIER_OK = False
+
+try:
     from build_spark_fp2 import load_kernel          # noqa: E402
     _kernel = load_kernel()
     _KERNEL_AVAILABLE = True                          # GPU 可用时才为 True
@@ -410,6 +422,46 @@ class NVFP4QATLinear(nn.Module):
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
+class TwoFourQATLinear(nn.Module):
+    """v3 QAT 层：2:4 结构化稀疏 + SPFP2 量化（MLP 层的 v3 升级档）。
+
+    前向 = two_four_fake_quant（量化 → 每组≤2非零约束，STE 直通），
+    缓存机制与其它 QAT 层一致。导出用 two_four_pack（1.75 bit/权重）。
+    """
+    force_fake_quant: bool = False
+
+    def __init__(self, in_features: int, out_features: int,
+                 bias: bool = True, device=None, dtype=None):
+        super().__init__()
+        assert _V3_AVAILABLE, "two_four 模块不可用"
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features,
+                                               device=device, dtype=dtype))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+        else:
+            self.register_parameter('bias', None)
+        self._wq_cache: Optional[torch.Tensor] = None
+        self._wq_ver: int = -1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.training or self.force_fake_quant:
+            if self._wq_cache is None or self._wq_ver != _WQ_VERSION[0]:
+                with torch.no_grad():
+                    self._wq_cache = two_four_fake_quant(
+                        self.weight.detach()).to(self.weight.dtype)
+                self._wq_ver = _WQ_VERSION[0]
+            w_eff = self.weight + (self._wq_cache - self.weight).detach()
+            return torch.nn.functional.linear(x, w_eff, self.bias)
+        return torch.nn.functional.linear(x, self.weight, self.bias)
+
+    def quantize(self):
+        """v3 位流导出（1.75 bit/权重）。"""
+        self._packed_weight = two_four_pack(self.weight.data.detach())
+        self._packed_format = "v3-24"
+
+
 def _nvfp4_replacement(module: nn.Linear) -> nn.Module:
     q = NVFP4QATLinear(module.in_features, module.out_features,
                        module.bias is not None,
@@ -496,7 +548,8 @@ def _spfp2_replacement(module: nn.Linear) -> nn.Module:
     return q
 
 
-def apply_mixed_quant(model: nn.Module, quantize_head: bool = False) -> nn.Module:
+def apply_mixed_quant(model: nn.Module, quantize_head: bool = False,
+                      v3: bool = False, fp3_tier: bool = False) -> nn.Module:
     """混合量化替换（NVFP4 + SPFP2 + INT8 + BF16）：
 
       - 默认（quantize_head=False）：
@@ -566,11 +619,27 @@ def apply_mixed_quant(model: nn.Module, quantize_head: bool = False) -> nn.Modul
             stats["bf16"][1] += module.weight.numel()
             continue
         if 'mlp' in path:
-            replacements.append((path, "spfp2"))
+            kind = "twofour" if v3 else "spfp2"
+            replacements.append((path, kind))
             stats["spfp2"][0] += 1
             stats["spfp2"][1] += module.weight.numel()
+        elif fp3_tier and 'in_proj_ba' in path:
+            # 实验1: GDN 门控 (b/a) 降为 SPFP2 —— 论文证明 softplus/sigmoid
+            # 在量化后压缩误差（y-error 仅 2%），是全部投影中最安全的
+            kind = "spfp2"
+            replacements.append((path, kind))
+            stats["spfp2"][0] += 1
+            stats["spfp2"][1] += module.weight.numel()
+        elif fp3_tier and 'out_proj' not in path:
+            # 实验1: 其余 attn/GDN 用 FP3 (3.5bit)
+            kind = "fp3"
+            replacements.append((path, kind))
+            stats.setdefault("fp3", [0, 0])
+            stats["fp3"][0] += 1
+            stats["fp3"][1] += module.weight.numel()
         else:
-            replacements.append((path, "nvfp4"))
+            kind = "nvfp4"
+            replacements.append((path, kind))
             stats["nvfp4"][0] += 1
             stats["nvfp4"][1] += module.weight.numel()
 
@@ -581,6 +650,24 @@ def apply_mixed_quant(model: nn.Module, quantize_head: bool = False) -> nn.Modul
         old = getattr(parent, leaf)
         if kind == "spfp2":
             setattr(parent, leaf, _spfp2_replacement(old))
+        elif kind == "fp3":
+            q = FP3QATLinear(old.in_features, old.out_features,
+                             old.bias is not None,
+                             device=old.weight.device, dtype=old.weight.dtype)
+            with torch.no_grad():
+                q.weight.copy_(old.weight)
+                if old.bias is not None:
+                    q.bias.copy_(old.bias)
+            setattr(parent, leaf, q)
+        elif kind == "twofour":
+            q = TwoFourQATLinear(old.in_features, old.out_features,
+                                old.bias is not None,
+                                device=old.weight.device, dtype=old.weight.dtype)
+            with torch.no_grad():
+                q.weight.copy_(old.weight)
+                if old.bias is not None:
+                    q.bias.copy_(old.bias)
+            setattr(parent, leaf, q)
         elif kind == "nvfp4":
             setattr(parent, leaf, _nvfp4_replacement(old))
         elif kind == "int8":

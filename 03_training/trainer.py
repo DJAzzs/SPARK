@@ -89,7 +89,8 @@ class SPARKQATrainer:
                  quant_mix: str = "fp2", quantize_head: bool = False,
                  ppl_data: str | None = None,
                  micro_batch: int = 8,
-                 resume_ckpt: str | None = None):
+                 resume_ckpt: str | None = None,
+                 fp3_tier: bool = False):
         self.data_parallel = data_parallel
         self.use_deepspeed = deepspeed
         self.token_budget = token_budget   # 单次 fwd+bwd 的最大 token 数（防 logits OOM）
@@ -117,7 +118,8 @@ class SPARKQATrainer:
         if quant_mix == "mixed":
             _p("[SPARK-QAT] 混合量化替换 (NVFP4 attn/DeltaNet + SPFP2 MLP + BF16 head)...")
             t1 = time.time()
-            apply_mixed_quant(self.model, quantize_head=quantize_head)
+            apply_mixed_quant(self.model, quantize_head=quantize_head,
+                          fp3_tier=fp3_tier)
         else:
             _p("[SPARK-QAT] 替换为 QAT 训练层 (channel-FP2 STE fake-quant)...")
             t1 = time.time()
@@ -273,7 +275,7 @@ class SPARKQATrainer:
             return None
 
     @torch.no_grad()
-    def _ppl_eval(self, max_blocks=12, batch=3, tag=""):
+    def _ppl_eval(self, max_blocks=40, batch=3, tag=""):
         """训练中 PPL：force_fake_quant 前向（量化语义），返回 ppl 或 None。"""
         if self._ppl_blocks is None:
             return None
@@ -656,6 +658,8 @@ def main():
     ap.add_argument("--quantize-head", action="store_true",
                     help="混合策略下量化 embed(NVFP4)/lm_head(INT8)，tied 自动共享"
                          "（9B 级 ~4.3GB 目标用；默认 head 保持 BF16）")
+    ap.add_argument("--fp3-tier", action="store_true",
+                    help="三档混合: GDN门控+MLP→SPFP2, 其余attn/GDN→FP3, out_proj+embed→NVFP4")
     ap.add_argument("--quant-mix", default="fp2", choices=["fp2", "mixed"],
                     help="量化策略：fp2=统一 SPFP2 | mixed=NVFP4(attn/DeltaNet)"
                          "+SPFP2(MLP)+BF16(head/状态参数)，对混合注意力架构"
@@ -698,7 +702,8 @@ def main():
                              quantize_head=args.quantize_head,
                              ppl_data=args.ppl_data,
                              micro_batch=args.batch_size,
-                             resume_ckpt=args.resume_ckpt)
+                             resume_ckpt=args.resume_ckpt,
+                             fp3_tier=args.fp3_tier)
 
     _p("[DATA ] 初始化流式 dataloader（仅读 metadata，不整表加载）...")
     t0 = time.time()

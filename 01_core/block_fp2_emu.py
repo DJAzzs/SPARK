@@ -17,10 +17,10 @@ import torch
 from typing import Tuple
 
 # ---- constants mirroring block_fp2_pack.h ----------------------------------------
-ELEMS_PER_BLOCK = 16        # SPARK_ELEMS_PER_BLOCK
+ELEMS_PER_BLOCK = 8         # SPARK_ELEMS_PER_BLOCK (v2.2: 16→8, 更细指数粒度)
 MANTISSA_BITS   = 2         # SPARK_MANTISSA_BITS
 EXP_BITS        = 4         # SPARK_EXP_BITS
-BYTES_PER_BLOCK = 5         # SPARK_BYTES_PER_BLOCK
+BYTES_PER_BLOCK = 3         # v2.2: 8权重=20bit→3字节对齐(24bit)
 BIAS            = 10.0      # spark_exp_bias(): scale=2^(e-10) ∈ [2^-10, 2^5]
                            # 覆盖 LLM 权重动态范围（bias=2 会整块归零，见 ptq_eval）
 
@@ -28,8 +28,9 @@ BIAS            = 10.0      # spark_exp_bias(): scale=2^(e-10) ∈ [2^-10, 2^5]
 DEFAULT_CANDIDATES = tuple(range(16))
 
 # ---- SPFP2 双块位打包（v2 存储格式）：2 块 72bit = 9 字节，2.25 bit/权重 ----
-BYTES_PER_PAIR = 9      # byte[0:4]=块0尾数u32LE, byte[4:8]=块1尾数u32LE,
-                        # byte[8]=低4bit块0指数 | 高4bit块1指数
+BYTES_PER_PAIR = 5      # v2.2双块(8w×2): 2×16bit尾数+2×4bit指数=40bit=5B
+                        # byte[0:2]=块0尾数u16LE, byte[2:4]=块1尾数u16LE,
+                        # byte[4]=低4bit块0指数|高4bit块1指数
 
 # mantissa code table (index by 2-bit code)
 _MANT_TABLE: Tuple[float, float, float, float] = (1.0, -1.0, 0.0, 0.0)
@@ -158,10 +159,10 @@ def pack_blockwise_search(w: torch.Tensor, candidates=DEFAULT_CANDIDATES,
     out = torch.zeros((nb * BYTES_PER_BLOCK,), dtype=torch.uint8, device=w.device)
     expv8 = (expv & 0x0F).to(torch.uint8)
     for bi in range(BYTES_PER_BLOCK):
-        if bi < 4:
+        if bi < 2:                                       # 16bit mantissa = 2 bytes
             v = ((mword >> (8 * bi)) & 0xFF).to(torch.uint8)
         else:
-            v = expv8
+            v = expv8                                    # byte 2: exp only
         out[bi::BYTES_PER_BLOCK] = v
     return out, expv8
 
@@ -185,17 +186,17 @@ def pack_blockwise(w: torch.Tensor) -> torch.Tensor:
 
     # mantissa word: 16×2 bit -> uint32 LE
     shl = torch.arange(0, ELEMS_PER_BLOCK * MANTISSA_BITS, MANTISSA_BITS,
-                       device=w.device)                # [0,2,...,30]
+                       device=w.device)                # [0,2,...,14] for 8w
     mword = (codes.to(torch.int64).view(nb, ELEMS_PER_BLOCK)
              << shl.view(1, -1)).sum(dim=1)            # [nb] uint32
 
     out = torch.zeros((nb * BYTES_PER_BLOCK,), dtype=torch.uint8, device=w.device)
-    mask256 = (expv & 0x0F).to(torch.int64)
+    exp8 = (expv & 0x0F).to(torch.uint8)
     for bi in range(BYTES_PER_BLOCK):
-        if bi < 4:
+        if bi < 2:                                       # 16bit mantissa
             v = ((mword >> (8 * bi)) & 0xFF).to(torch.uint8)
         else:
-            v = mask256.to(torch.uint8)                 # byte 4: exp only
+            v = exp8                                     # byte 2: exp only
         out[bi::BYTES_PER_BLOCK] = v
     return out
 
@@ -207,10 +208,10 @@ def unpack_blockwise(packed: torch.Tensor, n_elements: int,
     wb = torch.zeros((nb, ELEMS_PER_BLOCK), dtype=dtype,
                      device=packed.device)
     mant_b = torch.zeros(nb, dtype=torch.int64, device=packed.device)
-    for bi in range(4):
-        col = packed[bi::BYTES_PER_BLOCK].to(torch.int64)  # byte slice
+    for bi in range(2):                                    # 16bit mantissa = 2 bytes
+        col = packed[bi::BYTES_PER_BLOCK].to(torch.int64)
         mant_b |= (col << (8 * bi))
-    expv = (packed[4::BYTES_PER_BLOCK] & 0x0F).to(torch.int64)
+    expv = (packed[2::BYTES_PER_BLOCK] & 0x0F).to(torch.int64)
     scale = (2.0 ** (expv.to(torch.float32) - BIAS)).unsqueeze(-1).to(dtype)
 
     for i in range(ELEMS_PER_BLOCK):
@@ -241,12 +242,11 @@ def pack_blockwise_paired(w: torch.Tensor, window: int = 2):
     n = w.numel(); assert n % ELEMS_PER_BLOCK == 0
     nb = n // ELEMS_PER_BLOCK
 
-    # 复用统一搜索打包得到 mword/expv（从 5 字节格式提取尾数字）
-    p5, expv8 = pack_blockwise_search(w, window=window)
-    p5v = p5.view(nb, BYTES_PER_BLOCK).to(torch.int64)
-    mword = (p5v[:, 0] | (p5v[:, 1] << 8) | (p5v[:, 2] << 16)
-             | (p5v[:, 3] << 24))                              # [nb] u32
-    expv = p5v[:, 4]                                           # [nb] 0..15
+    # 复用统一搜索打包得到 mword/expv（从 3 字节格式提取尾数字）
+    p3, expv8 = pack_blockwise_search(w, window=window)
+    p3v = p3.view(nb, BYTES_PER_BLOCK).to(torch.int64)
+    mword = (p3v[:, 0] | (p3v[:, 1] << 8))                     # [nb] u16
+    expv = p3v[:, 2]                                           # [nb] 0..15
 
     # pad 到偶数块
     if nb % 2 == 1:
@@ -260,10 +260,10 @@ def pack_blockwise_paired(w: torch.Tensor, window: int = 2):
     out = torch.zeros((n_pairs * BYTES_PER_PAIR,),
                       dtype=torch.uint8, device=w.device)
     ov = out.view(n_pairs, BYTES_PER_PAIR)
-    for bi in range(4):
+    for bi in range(2):                                    # 16bit mantissa = 2 bytes
         ov[:, bi] = ((m0 >> (8 * bi)) & 0xFF).to(torch.uint8)
-        ov[:, 4 + bi] = ((m1 >> (8 * bi)) & 0xFF).to(torch.uint8)
-    ov[:, 8] = (e0 | (e1 << 4)).to(torch.uint8)
+        ov[:, 2 + bi] = ((m1 >> (8 * bi)) & 0xFF).to(torch.uint8)
+    ov[:, 4] = (e0 | (e1 << 4)).to(torch.uint8)
     return out, expv8
 
 
@@ -276,16 +276,16 @@ def unpack_blockwise_paired(packed: torch.Tensor, n_elements: int,
     n_pairs = packed.numel() // BYTES_PER_PAIR
     pv = packed.view(n_pairs, BYTES_PER_PAIR).to(torch.int64)
 
-    def _le_u32(cols):
+    def _le_u16(cols):
         v = torch.zeros(n_pairs, dtype=torch.int64, device=packed.device)
-        for bi in range(4):
+        for bi in range(2):
             v |= (cols[:, bi] << (8 * bi))
         return v
 
-    m0 = _le_u32(pv[:, 0:4])
-    m1 = _le_u32(pv[:, 4:8])
-    e0 = pv[:, 8] & 0x0F
-    e1 = (pv[:, 8] >> 4) & 0x0F
+    m0 = _le_u16(pv[:, 0:2])
+    m1 = _le_u16(pv[:, 2:4])
+    e0 = pv[:, 4] & 0x0F
+    e1 = (pv[:, 4] >> 4) & 0x0F
 
     def _decode(mword, expv):
         # mantissa 码表解码（与 unpack_blockwise 同口径）

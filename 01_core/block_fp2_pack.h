@@ -11,7 +11,7 @@
 // emu and kernel is enforced by 05_tests/test_block_decoding.py.
 #pragma once
 
-#define SPARK_ELEMS_PER_BLOCK  16      // weights sharing one exponent
+#define SPARK_ELEMS_PER_BLOCK  8       // v2.2: 16→8 (更细指数粒度)
 #define SPARK_MANTISSA_BITS    2       // bits per element mantissa (codes {-1,0,+1})
 #define SPARK_EXP_BITS         4       // shared FP4 exponent width
 #define SPARK_BYTES_PER_BLOCK  5       // (16*2 + 4) = 36 bit -> aligned to 40 bit
