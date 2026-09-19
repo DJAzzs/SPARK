@@ -92,7 +92,8 @@ class SPARKQATrainer:
                  micro_batch: int = 8,
                  resume_ckpt: str | None = None,
                  fp3_tier: bool = False,
-                 fp3_aggressive: bool = False):
+                 fp3_aggressive: bool = False,
+                 v3_sparse: bool = False):
         self.data_parallel = data_parallel
         self.use_deepspeed = deepspeed
         self.token_budget = token_budget   # 单次 fwd+bwd 的最大 token 数（防 logits OOM）
@@ -122,7 +123,8 @@ class SPARKQATrainer:
             t1 = time.time()
             apply_mixed_quant(self.model, quantize_head=quantize_head,
                           fp3_tier=fp3_tier,
-                          fp3_aggressive=fp3_aggressive)
+                          fp3_aggressive=fp3_aggressive,
+                          v3=v3_sparse)
         else:
             _p("[SPARK-QAT] 替换为 QAT 训练层 (channel-FP2 STE fake-quant)...")
             t1 = time.time()
@@ -673,6 +675,8 @@ def main():
     ap.add_argument("--quantize-head", action="store_true",
                     help="混合策略下量化 embed(NVFP4)/lm_head(INT8)，tied 自动共享"
                          "（9B 级 ~4.3GB 目标用；默认 head 保持 BF16）")
+    ap.add_argument("--v3-sparse", action="store_true",
+                    help="v3: MLP 层用 TwoFour 2:4 稀疏 (1.75bit, tensor core 加速)")
     ap.add_argument("--fp3-aggressive", action="store_true",
                     help="激进版: 仅attn o_proj用FP3, 其余全SPFP2")
     ap.add_argument("--fp3-tier", action="store_true",
@@ -721,7 +725,8 @@ def main():
                              micro_batch=args.batch_size,
                              resume_ckpt=args.resume_ckpt,
                              fp3_tier=args.fp3_tier,
-                             fp3_aggressive=args.fp3_aggressive)
+                             fp3_aggressive=args.fp3_aggressive,
+                             v3_sparse=args.v3_sparse)
 
     _p("[DATA ] 初始化流式 dataloader（仅读 metadata，不整表加载）...")
     t0 = time.time()
