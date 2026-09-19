@@ -33,6 +33,7 @@ for _p in (_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "02_model"),
         sys.path.insert(0, _p)
 
 import torch
+import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from fp3_linear import FP3QATLinear
@@ -125,6 +126,26 @@ class SPARKQATrainer:
                           fp3_tier=fp3_tier,
                           fp3_aggressive=fp3_aggressive,
                           v3=v3_sparse)
+        elif quant_mix == "mlp":
+            _p("[SPARK-QAT] 仅 MLP 替换为 SPFP2 QAT (attn/GDN 保持 BF16)...")
+            t1 = time.time()
+            from quant_linear import ChannelFP2QATLinear
+            for name, module in list(self.model.named_modules()):
+                if isinstance(module, nn.Linear) and 'mlp' in name:
+                    parts = name.split('.')
+                    parent_path = '.'.join(parts[:-1])
+                    leaf = parts[-1]
+                    parent = self.model.get_submodule(parent_path)
+                    q = ChannelFP2QATLinear(
+                        module.in_features, module.out_features,
+                        module.bias is not None,
+                        device=module.weight.device,
+                        dtype=module.weight.dtype)
+                    with torch.no_grad():
+                        q.weight.copy_(module.weight)
+                        if module.bias is not None:
+                            q.bias.copy_(module.bias)
+                    setattr(parent, leaf, q)
         else:
             _p("[SPARK-QAT] 替换为 QAT 训练层 (channel-FP2 STE fake-quant)...")
             t1 = time.time()
@@ -681,7 +702,7 @@ def main():
                     help="激进版: 仅attn o_proj用FP3, 其余全SPFP2")
     ap.add_argument("--fp3-tier", action="store_true",
                     help="三档混合: GDN门控+MLP→SPFP2, 其余attn/GDN→FP3, out_proj+embed→NVFP4")
-    ap.add_argument("--quant-mix", default="fp2", choices=["fp2", "mixed"],
+    ap.add_argument("--quant-mix", default="fp2", choices=["fp2", "mixed", "mlp"],
                     help="量化策略：fp2=统一 SPFP2 | mixed=NVFP4(attn/DeltaNet)"
                          "+SPFP2(MLP)+BF16(head/状态参数)，对混合注意力架构"
                          "（Qwen3.5 DeltaNet）推荐 mixed")

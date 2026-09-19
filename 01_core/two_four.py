@@ -32,21 +32,15 @@ BYTES_PER_PAIR = 7   # 56 bit / 32 权重
 def two_four_apply(q: torch.Tensor) -> torch.Tensor:
     """对已量化（三元）值施加 2:4 约束：每 4 连续权重至多 2 非零。
 
-    q: 任意形状（最后一维按 4 分组），值应为 {0,±s} 三元。
-    非零 >2 的组按 |值| 保留 Top-2（同 scale 时按出现序）。
+    全向量化——按 |值| 保留每组 Top-2，其余置零。
     """
     shape = q.shape
-    flat = q.reshape(-1, 4).clone()
-    nz_mask = flat != 0
-    nz_cnt = nz_mask.sum(dim=1)
-    over = nz_cnt > 2
-    if over.any():
-        for r in over.nonzero().flatten().tolist():
-            row = flat[r]
-            order = row.abs().argsort(descending=True)
-            drop = order[2:]          # 保留 top-2，其余清零
-            row[drop] = 0.0
-    return flat.reshape(shape)
+    flat = q.reshape(-1, 4)
+    # 每组按绝对值排序，保留 top-2
+    order = flat.abs().argsort(dim=1, descending=True)
+    keep = torch.zeros_like(flat, dtype=torch.bool)
+    keep.scatter_(1, order[:, :2], True)
+    return (flat * keep).reshape(shape)
 
 
 def two_four_mask_raw(w: torch.Tensor) -> torch.Tensor:
