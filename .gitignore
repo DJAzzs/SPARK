@@ -36,3 +36,6 @@ Qwen--P-MMEval/
 data/spark_v2_*/
 Dataset-fresh/
 data/spark-4b-final.spark/
+
+# 构建残骸
+.build/
