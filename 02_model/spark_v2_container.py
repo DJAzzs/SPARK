@@ -42,7 +42,7 @@ def _compress(t: torch.Tensor) -> bytes:
         raw = t.contiguous().view(torch.uint16).numpy().tobytes()
     else:
         raw = t.contiguous().numpy().tobytes()
-    return zstd.ZstdCompressor(level=19).compress(raw)
+    return zstd.ZstdCompressor(level=19, threads=-1).compress(raw)
 
 
 def _decompress(buf: bytes, dtype: torch.dtype) -> torch.Tensor:
@@ -83,20 +83,50 @@ def save_spark_v2(state: dict, out_dir: str, base_model_dir: str | None = None):
                                          bytes=len(payload), **extra)
         stats["comp"] += len(payload)
 
-    skip_prefixes = ("_meta", "_scale_index", "_nvfp4_scales")  # 并入对应条目
+    from concurrent.futures import ThreadPoolExecutor
+
+    skip_prefixes = ("_meta", "_scale_index", "_nvfp4_scales",
+                     "_fp3_scales")  # 并入对应条目
+
+    # 阶段 1: 并行压缩所有需要的 tensor
+    _to_pack = []
     for key, val in state.items():
         if any(key.endswith(sfx) for sfx in skip_prefixes):
             continue
-        raw_b = val.numel() * val.element_size()
-        stats["raw"] += raw_b
+        _to_pack.append((key, val))
+        stats["raw"] += val.numel() * val.element_size()
 
-        if key.endswith("_nvfp4_codes"):
+    import time as _t; _t0 = _t.time()
+    _compressed = [None] * len(_to_pack)
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+        futs = {ex.submit(_compress, v): i for i, (_, v) in enumerate(_to_pack)}
+        for f, i in futs.items():
+            pass  # submit all
+        for f, i in futs.items():
+            _compressed[i] = f.result()
+    print(f"  [compress] {len(_to_pack)} tensors, "
+          f"{os.cpu_count()} threads, {_t.time()-_t0:.1f}s")
+
+    # 阶段 2: 写文件（串行，I/O 密集）
+    for idx, (key, val) in enumerate(_to_pack):
+        val_c = _compressed[idx]
+
+        if key.endswith("_fp3_codes"):
+            layer = key[: -len("_fp3_codes")]
+            meta = state.get(layer + "_meta")
+            sc = state.get(layer + "_fp3_scales")
+            oc, ic = (int(meta[0]), int(meta[1])) if meta is not None \
+                else (None, None)
+            _emit(key, "fp3_codes", val_c, oc=oc, ic=ic)
+            if sc is not None:
+                _emit(layer + "_fp3_scales", "fp3_scales", _compress(sc))
+        elif key.endswith("_nvfp4_codes"):
             layer = key[: -len("_nvfp4_codes")]
             meta = state.get(layer + "_meta")
             sc = state.get(layer + "_nvfp4_scales")
             oc, ic = (int(meta[0]), int(meta[1])) if meta is not None \
                 else (None, None)
-            _emit(key, "nvfp4_codes", _compress(val), oc=oc, ic=ic)
+            _emit(key, "nvfp4_codes", val_c, oc=oc, ic=ic)
             if sc is not None:
                 _emit(layer + "_nvfp4_scales", "nvfp4_scales", _compress(sc))
         elif key.endswith("_nvfp4_weight"):
@@ -115,7 +145,7 @@ def save_spark_v2(state: dict, out_dir: str, base_model_dir: str | None = None):
             meta = state.get(layer + "_meta")
             oc, ic = (int(meta[0]), int(meta[1])) if meta is not None \
                 else (None, None)
-            _emit(key, "spfp2_packed", _compress(val), oc=oc, ic=ic)
+            _emit(key, "spfp2_packed", val_c, oc=oc, ic=ic)
         elif key.startswith("param::") and "lm_head" in key:
             q, scale = ptq_int8_pack(val.float())
             _emit(key, "int8_head_q", _compress(q), shape=list(val.shape))
@@ -126,7 +156,7 @@ def save_spark_v2(state: dict, out_dir: str, base_model_dir: str | None = None):
             _emit(key, "param_fp32", _compress(val.float()),
                   shape=list(val.shape))
         else:
-            _emit(key, "raw", _compress(val))
+            _emit(key, "raw", val_c)
 
     if base_model_dir:
         src = os.path.join(base_model_dir, "config.json")
@@ -151,7 +181,16 @@ def load_spark_v2(out_dir: str) -> dict:
 
     for key, e in manifest["tensors"].items():
         kind = e["kind"]
-        if kind == "nvfp4_codes":
+        if kind == "fp3_codes":
+            codes = _decompress(_read_blob(out_dir, e["file"]), torch.uint8)
+            nv_meta.setdefault(key, {})["codes"] = codes
+            nv_meta[key]["oc"], nv_meta[key]["ic"] = e["oc"], e["ic"]
+        elif kind == "fp3_scales":
+            scales = _decompress(_read_blob(out_dir, e["file"]),
+                                 torch.float8_e4m3fn)
+            base = key.replace("_fp3_scales", "_fp3_codes")
+            nv_meta.setdefault(base, {})["scales"] = scales
+        elif kind == "nvfp4_codes":
             codes = _decompress(_read_blob(out_dir, e["file"]), torch.uint8)
             nv_meta.setdefault(key, {})["codes"] = codes
             nv_meta[key]["oc"], nv_meta[key]["ic"] = e["oc"], e["ic"]
@@ -185,10 +224,16 @@ def load_spark_v2(out_dir: str) -> dict:
         if "codes" in m and "scales" in m:
             # 直通原生码流（解码归 apply_spark_state，容器只管解压）
             state[key] = m["codes"]
-            state[key.replace("_nvfp4_codes", "_nvfp4_scales")] = m["scales"]
-            if m.get("oc") is not None:
-                state[key.replace("_nvfp4_codes", "") + "_meta"] = \
-                    torch.tensor([m["oc"], m["ic"]], dtype=torch.long)
+            if "_fp3_codes" in key:
+                state[key.replace("_fp3_codes", "_fp3_scales")] = m["scales"]
+                if m.get("oc") is not None:
+                    state[key.replace("_fp3_codes", "") + "_meta"] = \
+                        torch.tensor([m["oc"], m["ic"]], dtype=torch.long)
+            else:
+                state[key.replace("_nvfp4_codes", "_nvfp4_scales")] = m["scales"]
+                if m.get("oc") is not None:
+                    state[key.replace("_nvfp4_codes", "") + "_meta"] = \
+                        torch.tensor([m["oc"], m["ic"]], dtype=torch.long)
     for key, h in heads.items():
         if "scale" in h:
             state[key] = ptq_int8_unpack(h["q"], h["scale"]).bfloat16()

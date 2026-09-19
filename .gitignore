@@ -35,3 +35,4 @@ Qwen--P-MMEval/
 .tf5/
 data/spark_v2_*/
 Dataset-fresh/
+data/spark-4b-final.spark/

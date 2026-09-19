@@ -35,6 +35,7 @@ for _p in (_PROJECT_ROOT, os.path.join(_PROJECT_ROOT, "02_model"),
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from fp3_linear import FP3QATLinear
 from quant_linear import (apply_channel_fp2_qat, apply_mixed_quant,
                           ChannelFP2QATLinear, bump_wq_version,
                           set_force_fake_quant)
@@ -90,7 +91,8 @@ class SPARKQATrainer:
                  ppl_data: str | None = None,
                  micro_batch: int = 8,
                  resume_ckpt: str | None = None,
-                 fp3_tier: bool = False):
+                 fp3_tier: bool = False,
+                 fp3_aggressive: bool = False):
         self.data_parallel = data_parallel
         self.use_deepspeed = deepspeed
         self.token_budget = token_budget   # 单次 fwd+bwd 的最大 token 数（防 logits OOM）
@@ -111,7 +113,7 @@ class SPARKQATrainer:
         t0 = time.time()
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, device_map={"": "cpu"}, low_cpu_mem_usage=True,
-            torch_dtype=torch.float32)
+            torch_dtype=torch.bfloat16 if resume_ckpt else torch.float32)
         _p(f"[SPARK-QAT] 模型加载完成 ({time.time()-t0:.1f}s), "
            f"参数 {sum(p.numel() for p in self.model.parameters())/1e6:.0f}M")
 
@@ -119,7 +121,8 @@ class SPARKQATrainer:
             _p("[SPARK-QAT] 混合量化替换 (NVFP4 attn/DeltaNet + SPFP2 MLP + BF16 head)...")
             t1 = time.time()
             apply_mixed_quant(self.model, quantize_head=quantize_head,
-                          fp3_tier=fp3_tier)
+                          fp3_tier=fp3_tier,
+                          fp3_aggressive=fp3_aggressive)
         else:
             _p("[SPARK-QAT] 替换为 QAT 训练层 (channel-FP2 STE fake-quant)...")
             t1 = time.time()
@@ -135,7 +138,7 @@ class SPARKQATrainer:
                 st = load_spark_v2(resume_ckpt)
             else:
                 st = torch.load(resume_ckpt, map_location="cpu",
-                                weights_only=False)
+                                weights_only=False, mmap=True)
             n1, n2, n3 = apply_spark_state(self.model, st)
             _p(f"[SPARK-QAT] resume 应用: packed={n1} nvfp4={n2} params={n3}")
 
@@ -569,6 +572,7 @@ class SPARKQATrainer:
         state = {}
         nq = 0
         m = self._unwrap()
+        from fp3_linear import FP3QATLinear
         from quant_linear import (ChannelFP2QATLinear, NVFP4QATLinear,
                                   NVFP4EmbeddingQAT)
         try:
@@ -587,6 +591,17 @@ class SPARKQATrainer:
                         state[n + '_scale_index'] = module._channel_scale_index.cpu()
                     state[n + '_meta'] = torch.tensor(
                         [module.out_features, module.in_features], dtype=torch.long)
+                    quant_param_ids.add(id(module.weight))
+                elif isinstance(module, FP3QATLinear):
+                    nq += 1
+                    # FP3 原生码流（E1M1 3bit + FP8 scale）
+                    from fp3_emu import fp3_pack_3bit as fp3_pack
+                    from fp3_linear import FP3QATLinear as _F3
+                    codes, scales = fp3_pack(module.weight.detach().float())
+                    state[n + '_fp3_codes'] = codes.cpu()
+                    state[n + '_fp3_scales'] = scales.cpu()
+                    oc, ic = module.weight.shape
+                    state[n + '_meta'] = torch.tensor([oc, ic], dtype=torch.long)
                     quant_param_ids.add(id(module.weight))
                 elif isinstance(module, (NVFP4QATLinear, NVFP4EmbeddingQAT)):
                     nq += 1
@@ -658,6 +673,8 @@ def main():
     ap.add_argument("--quantize-head", action="store_true",
                     help="混合策略下量化 embed(NVFP4)/lm_head(INT8)，tied 自动共享"
                          "（9B 级 ~4.3GB 目标用；默认 head 保持 BF16）")
+    ap.add_argument("--fp3-aggressive", action="store_true",
+                    help="激进版: 仅attn o_proj用FP3, 其余全SPFP2")
     ap.add_argument("--fp3-tier", action="store_true",
                     help="三档混合: GDN门控+MLP→SPFP2, 其余attn/GDN→FP3, out_proj+embed→NVFP4")
     ap.add_argument("--quant-mix", default="fp2", choices=["fp2", "mixed"],
@@ -703,7 +720,8 @@ def main():
                              ppl_data=args.ppl_data,
                              micro_batch=args.batch_size,
                              resume_ckpt=args.resume_ckpt,
-                             fp3_tier=args.fp3_tier)
+                             fp3_tier=args.fp3_tier,
+                             fp3_aggressive=args.fp3_aggressive)
 
     _p("[DATA ] 初始化流式 dataloader（仅读 metadata，不整表加载）...")
     t0 = time.time()

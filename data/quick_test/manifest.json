@@ -1,0 +1,25 @@
+{
+ "version": "2.0",
+ "format": "spark-v2",
+ "tensors": {
+  "a_packed": {
+   "kind": "spfp2_packed",
+   "file": "tensors/a_packed.zst",
+   "bytes": 1010,
+   "oc": null,
+   "ic": null
+  },
+  "b_fp3_codes": {
+   "kind": "fp3_codes",
+   "file": "tensors/b_fp3_codes.zst",
+   "bytes": 510,
+   "oc": 100,
+   "ic": 80
+  },
+  "b_fp3_scales": {
+   "kind": "fp3_scales",
+   "file": "tensors/b_fp3_scales.zst",
+   "bytes": 59
+  }
+ }
+}

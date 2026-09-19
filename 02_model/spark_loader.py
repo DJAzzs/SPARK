@@ -122,6 +122,19 @@ def apply_spark_state(model, state):
             if sd in msd and msd[sd].shape == dec.shape:
                 msd[sd].copy_(dec.to(msd[sd].dtype))
                 n1 += 1
+        elif key.endswith('_fp3_codes'):
+            layer = key[: -len('_fp3_codes')]
+            sc_key = layer + '_fp3_scales'
+            meta = state.get(layer + '_meta')
+            if sc_key not in state or meta is None:
+                continue
+            from fp3_emu import fp3_unpack_3bit as fp3_unpack
+            oc, ic = int(meta[0]), int(meta[1])
+            w = fp3_unpack(state[key], state[sc_key], oc, ic)
+            sd = layer + '.weight'
+            if sd in msd and msd[sd].shape == w.shape:
+                msd[sd].copy_(w.to(msd[sd].dtype))
+                n2 += 1
         elif key.endswith('_nvfp4_codes'):
             layer = key[: -len('_nvfp4_codes')]
             sc_key = layer + '_nvfp4_scales'

@@ -549,7 +549,8 @@ def _spfp2_replacement(module: nn.Linear) -> nn.Module:
 
 
 def apply_mixed_quant(model: nn.Module, quantize_head: bool = False,
-                      v3: bool = False, fp3_tier: bool = False) -> nn.Module:
+                      v3: bool = False, fp3_tier: bool = False,
+                      fp3_aggressive: bool = False) -> nn.Module:
     """混合量化替换（NVFP4 + SPFP2 + INT8 + BF16）：
 
       - 默认（quantize_head=False）：
@@ -623,9 +624,21 @@ def apply_mixed_quant(model: nn.Module, quantize_head: bool = False,
             replacements.append((path, kind))
             stats["spfp2"][0] += 1
             stats["spfp2"][1] += module.weight.numel()
+        elif fp3_tier and fp3_aggressive and 'o_proj' in path:
+            # 实验2(激进): 仅 attn o_proj 用 FP3，其余全降 SPFP2
+            kind = "fp3"
+            replacements.append((path, kind))
+            stats.setdefault("fp3", [0, 0])
+            stats["fp3"][0] += 1
+            stats["fp3"][1] += module.weight.numel()
+        elif fp3_tier and fp3_aggressive and 'out_proj' not in path:
+            # 实验2(激进): MLP+GDN门控+GDN主投影+attn q/k/v 全部 SPFP2
+            kind = "spfp2"
+            replacements.append((path, kind))
+            stats["spfp2"][0] += 1
+            stats["spfp2"][1] += module.weight.numel()
         elif fp3_tier and 'in_proj_ba' in path:
-            # 实验1: GDN 门控 (b/a) 降为 SPFP2 —— 论文证明 softplus/sigmoid
-            # 在量化后压缩误差（y-error 仅 2%），是全部投影中最安全的
+            # 实验1: GDN 门控 (b/a) 降为 SPFP2
             kind = "spfp2"
             replacements.append((path, kind))
             stats["spfp2"][0] += 1
