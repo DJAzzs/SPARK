@@ -568,13 +568,17 @@ class SPARKQATrainer:
                     t_tokens = now
                     tokens_seen = 0
 
-            if ppl_every > 0 and (step + 1) % ppl_every == 0 and self.is_main:
-                self._ppl_eval(tag=f" {step+1}")
-
-            if (step + 1) % 1000 == 0:
+            # 先保存 ckpt 再测 PPL（防 PPL 评测期间崩溃丢失进度）
+            if (step + 1) % 500 == 0:
                 if self.is_main:
                     _p(f"[CKPT ] {step+1} 步，保存量化检查点...")
                 self._save_quantized(outdir, tag=step + 1)
+
+            if ppl_every > 0 and (step + 1) % ppl_every == 0 and self.is_main:
+                try:
+                    self._ppl_eval(tag=f" {step+1}")
+                except Exception as e:
+                    _p(f"[PPL ] 评测失败（ckpt 已保存）: {type(e).__name__}")
 
         if self.is_main:
             self._save_quantized(outdir, tag="final")

@@ -82,7 +82,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model, device_map=device, low_cpu_mem_usage=True,
         torch_dtype=torch.bfloat16)
-    state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+    if os.path.isdir(args.ckpt):
+        from spark_v2_container import load_spark_v2
+        state = load_spark_v2(args.ckpt)
+    else:
+        state = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     n1, n2, n3 = apply_spark_state(model, state)
     print(f"      apply: packed={n1} nvfp4={n2} params={n3}")
     model.eval()
