@@ -115,7 +115,7 @@ class SPARKQATrainer:
         t0 = time.time()
         self.model = AutoModelForCausalLM.from_pretrained(
             model_path, device_map={"": "cpu"}, low_cpu_mem_usage=True,
-            torch_dtype=torch.bfloat16 if resume_ckpt else torch.float32)
+            torch_dtype=torch.bfloat16)
         _p(f"[SPARK-QAT] 模型加载完成 ({time.time()-t0:.1f}s), "
            f"参数 {sum(p.numel() for p in self.model.parameters())/1e6:.0f}M")
 

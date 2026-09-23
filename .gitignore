@@ -40,3 +40,4 @@ data/spark-4b-final.spark/
 # 构建残骸
 .build/
 data/spark-4b-v23/
+data/spark-4b-final/
