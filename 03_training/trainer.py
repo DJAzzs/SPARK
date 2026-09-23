@@ -189,6 +189,7 @@ class SPARKQATrainer:
             cfg = {
                 "bf16": {"enabled": dtype_str == "bf16"},
                 "fp16": {"enabled": dtype_str == "fp16"},
+                "zero_allow_untested_optimizer": True,  # 允许 8bit 优化器
                 "zero_optimization": {
                     "stage": 2,
                     "allgather_partitions": True,
